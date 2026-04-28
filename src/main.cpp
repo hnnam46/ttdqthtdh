@@ -52,13 +52,6 @@ DHT dht2(DHT_PIN_2, DHTTYPE);
 #define OLED_HEIGHT 64
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire1, -1);
 
-bool oledOn = true;
-unsigned long lastOledActivity = 0;
-const unsigned long OLED_TIMEOUT_MS = 120000;
-
-float lastDisplayedTemp = NAN;
-bool lastNetStatus = false;
-
 // ================== IR ==================
 #define IR_PIN 3
 IRsend irsend(IR_PIN);
@@ -67,9 +60,6 @@ IRsend irsend(IR_PIN);
 EthernetUDP ntpUDP;
 const char* ntpServer = "time.google.com";
 NTPClient timeClient(ntpUDP, ntpServer, 25200, 60000); // UTC+7
-
-bool ntpSynced = false;
-unsigned long lastNtpTry = 0;
 
 // ================== STRUCT ==================
 struct SensorState {
@@ -83,7 +73,7 @@ struct AcState {
   String name;
   String opr_mode;      // auto / man
   String power;         // on / off
-  String mode;          // cool / dry / auto / fan / heat
+  String mode;          // cool / dry
   String speed;
   String swing;
   String fac;           // daikin / pana / lg / mitsu / casper
@@ -104,6 +94,871 @@ struct RoomConfig {
   float thr_temp;
 };
 
+// ================== IR QUEUE ==================
+struct IrTask {
+  int acIndex;
+  bool fromUser;
+  unsigned long nextTime;
+  uint8_t retry;
+};
+
+class IrQueueManager {
+public:
+  static const uint8_t IR_QUEUE_SIZE = 16;
+  static const uint32_t IR_STAGGER_MS = 5000;
+
+  IrQueueManager() : head(0), tail(0) {}
+
+  bool enqueue(int acIndex, bool fromUser) {
+    uint8_t nextTail = (tail + 1) % IR_QUEUE_SIZE;
+    if (nextTail == head) {
+      log("IR QUEUE", "FULL → BO QUA");
+      return false;
+    }
+    queue[tail].acIndex = acIndex;
+    queue[tail].fromUser = fromUser;
+    queue[tail].retry = 0;
+    queue[tail].nextTime = millis();
+    tail = nextTail;
+    return true;
+  }
+
+  void process(AcState acs[], void (*sendIr)(AcState&)) {
+    if (head == tail) return;
+    IrTask &task = queue[head];
+    if (millis() < task.nextTime) return;
+
+    log("IR QUEUE",
+        "PROCESS acIndex=" + String(task.acIndex) +
+        " retry=" + String(task.retry) +
+        " fromUser=" + String(task.fromUser ? "Y" : "N"));
+
+    sendIr(acs[task.acIndex]);
+
+    task.retry++;
+    if (task.retry < 2) {
+      task.nextTime = millis() + IR_STAGGER_MS;
+      log("IR QUEUE", "SCHEDULE NEXT RETRY SAU 5s");
+    } else {
+      head = (head + 1) % IR_QUEUE_SIZE;
+      log("IR QUEUE", "DONE TASK → POP");
+    }
+  }
+
+private:
+  IrTask queue[IR_QUEUE_SIZE];
+  uint8_t head;
+  uint8_t tail;
+
+  static void log(const String &tag, const String &msg) {
+    Serial.print("[");
+    Serial.print(timeClient.getFormattedTime());
+    Serial.print("] ");
+    Serial.print(tag);
+    Serial.print(": ");
+    Serial.println(msg);
+  }
+};
+
+// ================== OLED MANAGER ==================
+class OledManager {
+public:
+  OledManager()
+    : oledOn(true),
+      lastOledActivity(0),
+      lastDisplayedTemp(NAN),
+      lastNetStatus(false) {}
+
+  void setup() {
+    Wire1.setSDA(6);
+    Wire1.setSCL(7);
+    Wire1.begin();
+    Wire1.setClock(400000);
+    delay(200);
+
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+      log("OLED", "INIT FAIL");
+      return;
+    }
+
+    oledOn = true;
+    lastOledActivity = millis();
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("OLED READY");
+    display.display();
+  }
+
+  void wake() {
+    if (!oledOn) {
+      oledOn = true;
+      display.ssd1306_command(SSD1306_DISPLAYON);
+      log("OLED", "WAKE");
+    }
+    lastOledActivity = millis();
+  }
+
+  void maybeSleep() {
+    if (oledOn && (millis() - lastOledActivity > OLED_TIMEOUT_MS)) {
+      oledOn = false;
+      display.clearDisplay();
+      display.display();
+      display.ssd1306_command(SSD1306_DISPLAYOFF);
+      log("OLED", "SLEEP TIMEOUT");
+    }
+  }
+
+  void update(bool netStatus, SensorState *active, bool ntpSynced) {
+    if (!oledOn) return;
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    float t = active ? active->temp : NAN;
+    float h = active ? active->hum  : NAN;
+
+    display.setCursor(0, 0);
+    display.print("Bld: ");
+    display.print(BUILDING_ID);
+    display.print(" Rm: ");
+    display.print(ROOM_ID);
+
+    display.setCursor(0, 12);
+    display.print("T/H: ");
+    if (!isnan(t) && !isnan(h)) {
+      display.print(t, 1);
+      display.print("C / ");
+      display.print(h, 1);
+      display.print("%");
+    } else {
+      display.print("ERR");
+    }
+
+    display.setCursor(0, 24);
+    display.print("Net: ");
+    display.print(netStatus ? "ONL" : "OFF");
+
+    display.setCursor(0, 36);
+    display.print("Time: ");
+    if (!ntpSynced)
+      display.print("WAIT NTP");
+    else
+      display.print(timeClient.getFormattedTime());
+
+    display.display();
+  }
+
+  void onTempChangeWake(float currentTemp) {
+    if (isnan(lastDisplayedTemp) || fabs(currentTemp - lastDisplayedTemp) >= 1.0f) {
+      log("SENSOR CHANGE", "ROOM TEMP Δ≥1C → WAKE OLED");
+      lastDisplayedTemp = currentTemp;
+      wake();
+    }
+  }
+
+private:
+  bool oledOn;
+  unsigned long lastOledActivity;
+  float lastDisplayedTemp;
+  bool lastNetStatus;
+
+  static const unsigned long OLED_TIMEOUT_MS = 120000;
+
+  static void log(const String &tag, const String &msg) {
+    Serial.print("[");
+    Serial.print(timeClient.getFormattedTime());
+    Serial.print("] ");
+    Serial.print(tag);
+    Serial.print(": ");
+    Serial.println(msg);
+  }
+};
+
+// ================== SENSOR MANAGER ==================
+class SensorManager {
+public:
+  SensorManager() {}
+
+  void setup() {
+    dht1.begin();
+    if (NUM_SENSOR > 1) dht2.begin();
+  }
+
+  void readOutdoor(SensorState sensors[NUM_SENSOR]) {
+    float t1 = dht1.readTemperature();
+    float h1 = dht1.readHumidity();
+    float t2 = dht2.readTemperature();
+    float h2 = dht2.readHumidity();
+
+    sensors[0].name = "ssenv1";
+    sensors[0].temp = t1;
+    sensors[0].hum  = h1;
+    sensors[0].ok   = !isnan(t1) && !isnan(h1);
+
+    sensors[1].name = "ssenv2";
+    sensors[1].temp = t2;
+    sensors[1].hum  = h2;
+    sensors[1].ok   = !isnan(t2) && !isnan(h2);
+
+    static float lastT1 = NAN, lastH1 = NAN, lastT2 = NAN, lastH2 = NAN;
+    if (sensors[0].ok && (isnan(lastT1) || fabs(t1 - lastT1) >= 0.5f || fabs(h1 - lastH1) >= 2.0f)) {
+      log("SENSOR CHANGE", "ssenv1 T=" + String(t1) + " H=" + String(h1));
+      lastT1 = t1; lastH1 = h1;
+    }
+    if (sensors[1].ok && (isnan(lastT2) || fabs(t2 - lastT2) >= 0.5f || fabs(h2 - lastH2) >= 2.0f)) {
+      log("SENSOR CHANGE", "ssenv2 T=" + String(t2) + " H=" + String(h2));
+      lastT2 = t2; lastH2 = h2;
+    }
+  }
+
+  void readIndoor(SensorState sensors[NUM_SENSOR]) {
+    float t1 = dht1.readTemperature();
+    float h1 = dht1.readHumidity();
+    sensors[0].name = "ssrom1";
+    sensors[0].temp = t1;
+    sensors[0].hum  = h1;
+    sensors[0].ok   = !isnan(t1) && !isnan(h1);
+
+    if (NUM_SENSOR > 1) {
+      float t2 = dht2.readTemperature();
+      float h2 = dht2.readHumidity();
+      sensors[1].name = "ssrom2";
+      sensors[1].temp = t2;
+      sensors[1].hum  = h2;
+      sensors[1].ok   = !isnan(t2) && !isnan(h2);
+    }
+
+    SensorState* active = getActiveSensor(sensors);
+    static float lastT = NAN, lastH = NAN;
+    if (active && active->ok) {
+      if (isnan(lastT) || fabs(active->temp - lastT) >= 0.5f ||
+          isnan(lastH) || fabs(active->hum - lastH) >= 2.0f) {
+        log("SENSOR CHANGE",
+            active->name + " T=" + String(active->temp) +
+            " H=" + String(active->hum));
+        lastT = active->temp;
+        lastH = active->hum;
+      }
+    } else {
+      log("ERROR SENSOR", "KHONG CO SENSOR HOP LE");
+    }
+  }
+
+  SensorState* getActiveSensor(SensorState sensors[NUM_SENSOR]) {
+    if (sensors[0].ok) return &sensors[0];
+    if (NUM_SENSOR > 1 && sensors[1].ok) return &sensors[1];
+    return nullptr;
+  }
+
+private:
+  static void log(const String &tag, const String &msg) {
+    Serial.print("[");
+    Serial.print(timeClient.getFormattedTime());
+    Serial.print("] ");
+    Serial.print(tag);
+    Serial.print(": ");
+    Serial.println(msg);
+  }
+};
+
+// ================== AC MANAGER ==================
+class AcManager {
+public:
+  AcManager(RoomConfig &cfg, IrQueueManager &queue)
+    : roomCfg(cfg), irQueue(queue), outdoorTemp(25.0f) {}
+
+  void setup(AcState acs[NUM_AC]) {
+    for (int i = 0; i < NUM_AC; i++) {
+      acs[i].name      = "ac" + String(i + 1);
+      acs[i].opr_mode  = "auto";
+      acs[i].power     = "off";
+      acs[i].mode      = "cool";
+      acs[i].speed     = "auto";
+      acs[i].swing     = "sw-auto";
+      acs[i].fac       = "daikin";
+      acs[i].ctrl_temp = 27.0f;
+      acs[i].sent_temp = 27.0f;
+      acs[i].prev_sent_temp = 27.0f;
+      acs[i].lastUserCmdMs = 0;
+      acs[i].lastAutoIrMs = 0;
+      acs[i].lastAutoRoomTemp = NAN;
+    }
+  }
+
+  void computeAuto(AcState acs[NUM_AC], SensorState *active) {
+    if (!active || !active->ok) return;
+
+    float t_room = active->temp;
+    float h_room = active->hum;
+    float t_out = outdoorTemp;
+
+    for (int i = 0; i < NUM_AC; i++) {
+      acs[i].prev_sent_temp = acs[i].sent_temp;
+      computeAutoForAc(acs[i], t_out, t_room, h_room, i);
+    }
+
+    unsigned long now = millis();
+    for (int i = 0; i < NUM_AC; i++) {
+      AcState &ac = acs[i];
+      if (ac.opr_mode == "auto" && ac.power == "on") {
+        if (ac.lastAutoIrMs > 0 && (now - ac.lastAutoIrMs > 300000)) {
+          if (!isnan(ac.lastAutoRoomTemp) &&
+              fabs(t_room - ac.lastAutoRoomTemp) < 0.5f) {
+            ac.sent_temp -= 1.0f;
+            log("AUTO CHANGE",
+                ac.name + " AUTO-ADJUST → giam 1C, sent_temp=" +
+                String(ac.sent_temp));
+
+            irQueue.enqueue(i, false);
+            ac.lastAutoIrMs = millis();
+            ac.lastAutoRoomTemp = t_room;
+          } else {
+            ac.lastAutoIrMs = now;
+            ac.lastAutoRoomTemp = t_room;
+          }
+        }
+      }
+    }
+  }
+
+  void setOutdoorTemp(float t) {
+    float old = outdoorTemp;
+    outdoorTemp = t;
+    if (fabs(outdoorTemp - old) >= 0.5f) {
+      log("SENSOR CHANGE", "OUTDOOR TEMP = " + String(outdoorTemp));
+    }
+  }
+
+  float getOutdoorTemp() const {
+    return outdoorTemp;
+  }
+
+  void applyUserCmd(AcState &ac, const String &param, const String &msg, int index) {
+    String oldMode = ac.mode;
+    String oldPower = ac.power;
+    float oldCtrl = ac.ctrl_temp;
+
+    if (param == "opr") {
+      ac.opr_mode = msg;
+    } else if (param == "power") {
+      ac.power = msg;
+    } else if (param == "mode") {
+      ac.mode = msg;
+    } else if (param == "speed") {
+      ac.speed = msg;
+    } else if (param == "swing") {
+      ac.swing = msg;
+    } else if (param == "fac") {
+      ac.fac = msg;
+    } else if (param == "ctrl_temp") {
+      ac.ctrl_temp = msg.toFloat();
+    }
+
+    ac.lastUserCmdMs = millis();
+
+    if (ac.mode != oldMode || ac.power != oldPower || fabs(ac.ctrl_temp - oldCtrl) >= 0.1f) {
+      log("AUTO CHANGE",
+          ac.name + " USER → opr=" + ac.opr_mode +
+          " power=" + ac.power +
+          " mode=" + ac.mode +
+          " fac=" + ac.fac +
+          " ctrl_temp=" + String(ac.ctrl_temp));
+    }
+
+    if (irQueue.enqueue(index, true)) {
+      log("IR QUEUE", "ENQUEUE USER → " + ac.name);
+    }
+  }
+
+  void updateConfig(const String &param, const String &msg) {
+    if (param == "temp_setauto") {
+      float old = roomCfg.temp_setauto;
+      roomCfg.temp_setauto = msg.toFloat();
+      if (fabs(roomCfg.temp_setauto - old) >= 0.1f)
+        log("AUTO CHANGE", "temp_setauto = " + String(roomCfg.temp_setauto));
+    } else if (param == "hum_setauto") {
+      float old = roomCfg.hum_setauto;
+      roomCfg.hum_setauto = msg.toFloat();
+      if (fabs(roomCfg.hum_setauto - old) >= 0.1f)
+        log("AUTO CHANGE", "hum_setauto = " + String(roomCfg.hum_setauto));
+    } else if (param == "thr_temp") {
+      float old = roomCfg.thr_temp;
+      roomCfg.thr_temp = msg.toFloat();
+      if (fabs(roomCfg.thr_temp - old) >= 0.1f)
+        log("AUTO CHANGE", "thr_temp = " + String(roomCfg.thr_temp));
+    }
+  }
+
+  void sendIr(AcState &ac) {
+    if (ac.power != "on") {
+      log("IR SEND", ac.name + " POWER OFF → KHONG PHAT IR");
+      return;
+    }
+
+    log("IR SEND",
+        ac.name + " fac=" + ac.fac +
+        " mode=" + ac.mode +
+        " temp=" + String(ac.sent_temp) +
+        " swing=" + ac.swing);
+
+    uint8_t t = (uint8_t)ac.sent_temp;
+    bool isCool = (ac.mode == "cool");
+
+    if (ac.fac == "daikin") {
+      IRDaikinESP ir(IR_PIN);
+      ir.begin();
+      ir.setPower(true);
+      ir.setTemp(t);
+      ir.setMode(isCool ? kDaikinCool : kDaikinDry);
+      ir.setFan(kDaikinFanAuto);
+      ir.setSwingVertical(ac.swing == "sw-auto" ? kDaikinSwingOn : kDaikinSwingOff);
+      ir.send();
+      return;
+    }
+
+    if (ac.fac == "pana") {
+      IRPanasonicAc ir(IR_PIN);
+      ir.begin();
+      ir.setPower(true);
+      ir.setTemp(t);
+      ir.setMode(isCool ? kPanasonicAcCool : kPanasonicAcDry);
+      ir.setFan(kPanasonicAcFanAuto);
+      ir.setSwingVertical(ac.swing == "sw-auto");
+      ir.send();
+      return;
+    }
+
+    if (ac.fac == "lg") {
+      IRLgAc ir(IR_PIN);
+      ir.begin();
+      ir.setPower(true);
+      ir.setTemp(t);
+      ir.setMode(isCool ? kLgAcCool : kLgAcDry);
+      ir.setFan(kLgAcFanAuto);
+      ir.send();
+      return;
+    }
+
+    if (ac.fac == "mitsu") {
+      IRMitsubishiAC ir(IR_PIN);
+      ir.begin();
+      ir.setPower(true);
+      ir.setTemp(t);
+      ir.setMode(isCool ? kMitsubishiAcCool : kMitsubishiAcDry);
+      ir.setFan(kMitsubishiAcFanAuto);
+      ir.setVane(kMitsubishiAcVaneAuto);
+      ir.send();
+      return;
+    }
+
+    if (ac.fac == "casper") {
+      log("IR SEND", "Casper: CHUA CO MA RAW, CAN BO SUNG SAU");
+      return;
+    }
+
+    log("IR SEND", "HANG KHONG HO TRO: " + ac.fac);
+  }
+
+  RoomConfig& getRoomCfg() { return roomCfg; }
+
+private:
+  RoomConfig &roomCfg;
+  IrQueueManager &irQueue;
+  float outdoorTemp;
+
+  void computeAutoForAc(AcState &ac, float t_outdoor, float t_room, float h_room, int index) {
+    if (ac.opr_mode == "man") {
+      ac.sent_temp = ac.ctrl_temp;
+      return;
+    }
+
+    float oldSent = ac.sent_temp;
+    String oldMode = ac.mode;
+
+    float targetTemp = roomCfg.temp_setauto;
+    String mode = "cool";
+
+    if (t_outdoor > 27.0f) {
+      targetTemp = roomCfg.temp_setauto;
+    } else if (t_outdoor < roomCfg.thr_temp) {
+      mode = "dry";
+      targetTemp = t_outdoor + 2.0f;
+    }
+
+    if (h_room > roomCfg.hum_setauto) {
+      mode = "dry";
+    } else if (h_room < 20.0f) {
+      mode = "cool";
+    }
+
+    ac.mode = mode;
+    ac.sent_temp = targetTemp;
+
+    if (fabs(ac.sent_temp - oldSent) >= 0.5f || ac.mode != oldMode) {
+      log("AUTO CHANGE",
+          ac.name + " AUTO → mode=" + ac.mode +
+          " sent_temp=" + String(ac.sent_temp) +
+          " (t_out=" + String(t_outdoor) +
+          " t_room=" + String(t_room) +
+          " h_room=" + String(h_room) + ")");
+    }
+
+    if (fabs(ac.sent_temp - oldSent) >= 0.5f) {
+      if (irQueue.enqueue(index, false)) {
+        log("IR QUEUE", "ENQUEUE AUTO → " + ac.name);
+        ac.lastAutoIrMs = millis();
+        ac.lastAutoRoomTemp = t_room;
+      }
+    }
+  }
+
+  static void log(const String &tag, const String &msg) {
+    Serial.print("[");
+    Serial.print(timeClient.getFormattedTime());
+    Serial.print("] ");
+    Serial.print(tag);
+    Serial.print(": ");
+    Serial.println(msg);
+  }
+};
+
+// ================== NETWORK / MQTT MANAGER ==================
+class NetworkManager {
+public:
+  NetworkManager(RoomConfig &cfg,
+                 SensorState sensors[NUM_SENSOR],
+                 AcState acs[NUM_AC],
+                 AcManager &acMgr,
+                 OledManager &oledMgr,
+                 IrQueueManager &irQueue)
+    : ethernetReady(false),
+      mqttConnected(false),
+      lastMqttReconnectAttempt(0),
+      mqttReconnectCount(0),
+      lastOutdoorReq(0),
+      ntpSynced(false),
+      roomCfg(cfg),
+      sensorsRef(sensors),
+      acsRef(acs),
+      acManager(acMgr),
+      oled(oledMgr),
+      irQueueMgr(irQueue) {}
+
+  void setup() {
+    setupEthernet();
+    mqttClient.setServer(mqtt_server, mqtt_port);
+    mqttClient.setCallback(mqttCallbackStatic);
+    timeClient.begin();
+  }
+
+  void loop() {
+    handleEthernetLink();
+    handleMqtt();
+    handleNtp();
+    handleOutdoorRequest();
+  }
+
+  bool isMqttConnected() const { return mqttConnected; }
+  bool isEthernetReady() const { return ethernetReady; }
+  bool isNtpSynced() const { return ntpSynced; }
+
+  void publishRoomState() {
+    StaticJsonDocument<4096> doc;
+
+    JsonArray jsSensors = doc.createNestedArray("sensors");
+    for (int i = 0; i < NUM_SENSOR; i++) {
+      JsonObject o = jsSensors.createNestedObject();
+      o["name"] = sensorsRef[i].name;
+      o["temp"] = sensorsRef[i].temp;
+      o["hum"]  = sensorsRef[i].hum;
+      o["ok"]   = sensorsRef[i].ok;
+    }
+
+    JsonArray jsAcs = doc.createNestedArray("acs");
+    for (int i = 0; i < NUM_AC; i++) {
+      JsonObject o = jsAcs.createNestedObject();
+      o["name"]      = acsRef[i].name;
+      o["opr"]       = acsRef[i].opr_mode;
+      o["power"]     = acsRef[i].power;
+      o["mode"]      = acsRef[i].mode;
+      o["speed"]     = acsRef[i].speed;
+      o["swing"]     = acsRef[i].swing;
+      o["fac"]       = acsRef[i].fac;
+      o["ctrl_temp"] = acsRef[i].ctrl_temp;
+      o["sent_temp"] = acsRef[i].sent_temp;
+    }
+
+    JsonObject cfg = doc.createNestedObject("cfg");
+    cfg["temp_setauto"] = roomCfg.temp_setauto;
+    cfg["hum_setauto"]  = roomCfg.hum_setauto;
+    cfg["thr_temp"]     = roomCfg.thr_temp;
+
+    char buffer[4096];
+    size_t len = serializeJson(doc, buffer, sizeof(buffer));
+
+    String topic = String(BUILDING_ID) + "/" + ROOM_ID + "/state";
+
+    if (!mqttClient.connected()) {
+      log("MQTT", "OFFLINE → KHONG GUI JSON");
+      return;
+    }
+
+    bool ok = mqttClient.publish(topic.c_str(), buffer);
+    log("MQTT", String("PUBLISH STATE → ") + (ok ? "OK" : "FAIL"));
+  }
+
+  static NetworkManager* instance;
+
+private:
+  bool ethernetReady;
+  bool mqttConnected;
+  uint32_t lastMqttReconnectAttempt;
+  uint8_t mqttReconnectCount;
+  unsigned long lastOutdoorReq;
+  bool ntpSynced;
+
+  RoomConfig &roomCfg;
+  SensorState *sensorsRef;
+  AcState *acsRef;
+  AcManager &acManager;
+  OledManager &oled;
+  IrQueueManager &irQueueMgr;
+
+  static void mqttCallbackStatic(char* topic, byte* payload, unsigned int length) {
+    if (instance) instance->mqttCallback(topic, payload, length);
+  }
+
+  void setupEthernet() {
+    log("ETH", "INIT...");
+    Ethernet.init(PIN_ETH_CS);
+    Ethernet.begin(mac);
+    delay(1000);
+    IPAddress ip = Ethernet.localIP();
+    if (ip[0] == 0) {
+      ethernetReady = false;
+      log("ETH", "NO IP (0.0.0.0)");
+    } else {
+      ethernetReady = true;
+      log("ETH", "IP = " + ip.toString());
+    }
+  }
+
+  String makeClientId() {
+    String cid = "pico_";
+    cid += BUILDING_ID;
+    cid += "_";
+    cid += ROOM_ID;
+    cid += "_";
+    cid += String((uint32_t)millis(), HEX);
+    return cid;
+  }
+
+  String availabilityTopic() {
+    return String(BUILDING_ID) + "/" + ROOM_ID + "/pico/availability";
+  }
+
+  void publishAvailabilityOnline() {
+    String key = availabilityTopic();
+    mqttClient.publish(key.c_str(), "online", true);
+    log("LWT", "ONLINE → " + key);
+  }
+
+  void mqttSubscribeAll() {
+    String t_ac = String(BUILDING_ID) + "/" + ROOM_ID + "/ac/+/+";
+    mqttClient.subscribe(t_ac.c_str());
+    log("MQTT SUB", t_ac);
+
+    String baseCfg = String(BUILDING_ID) + "/" + ROOM_ID + "/config/";
+    mqttClient.subscribe((baseCfg + "temp_setauto").c_str());
+    mqttClient.subscribe((baseCfg + "hum_setauto").c_str());
+    mqttClient.subscribe((baseCfg + "thr_temp").c_str());
+    log("MQTT SUB", baseCfg + "temp_setauto");
+    log("MQTT SUB", baseCfg + "hum_setauto");
+    log("MQTT SUB", baseCfg + "thr_temp");
+
+    String t_env = String(BUILDING_ID) + "/outdoor/sensor/1/temp";
+    mqttClient.subscribe(t_env.c_str());
+    log("MQTT SUB", t_env);
+  }
+
+  void mqttReconnect() {
+    if (!ethernetReady) return;
+    if (mqttClient.connected()) return;
+
+    uint32_t now = millis();
+    if (now - lastMqttReconnectAttempt < 8000) return;
+    lastMqttReconnectAttempt = now;
+
+    log("MQTT", "RECONNECTING...");
+
+    String clientId = makeClientId();
+    String lwtTopic = availabilityTopic();
+
+    if (mqttClient.connect(clientId.c_str(),
+                           mqtt_user, mqtt_pass,
+                           lwtTopic.c_str(), 0, true, "offline")) {
+      mqttConnected = true;
+      mqttReconnectCount = 0;
+      log("MQTT", "CONNECTED");
+      publishAvailabilityOnline();
+      if (ROLE_PICO == 2) mqttSubscribeAll();
+      oled.wake();
+    } else {
+      mqttConnected = false;
+      mqttReconnectCount++;
+      log("MQTT", "FAIL (" + String(mqttReconnectCount) + ")");
+    }
+  }
+
+  void handleEthernetLink() {
+    if (Ethernet.linkStatus() == LinkOFF) {
+      if (ethernetReady) {
+        ethernetReady = false;
+        log("ETH", "LINK OFF");
+      }
+    } else {
+      if (!ethernetReady) {
+        log("ETH", "LINK ON → REINIT");
+        setupEthernet();
+        oled.wake();
+      }
+    }
+  }
+
+  void handleMqtt() {
+    bool prevConn = mqttConnected;
+    if (!mqttClient.connected()) {
+      mqttReconnect();
+    }
+    mqttClient.loop();
+    mqttConnected = mqttClient.connected();
+    if (!mqttConnected && prevConn) {
+      log("MQTT", "DISCONNECTED SAU LOOP");
+    }
+
+    bool netStatus = mqttClient.connected();
+    static bool lastNet = false;
+    if (netStatus != lastNet) {
+      lastNet = netStatus;
+      log("NET CHANGE", netStatus ? "ONLINE" : "OFFLINE");
+      oled.wake();
+    }
+  }
+
+  void handleNtp() {
+    static bool mqttWasOnline = false;
+    static unsigned long mqttOnlineAt = 0;
+
+    if (!ethernetReady) return;
+    if (!mqttClient.connected()) {
+      mqttWasOnline = false;
+      return;
+    }
+
+    if (!mqttWasOnline) {
+      mqttWasOnline = true;
+      mqttOnlineAt = millis();
+      return;
+    }
+
+    if (millis() - mqttOnlineAt < 3000) return;
+
+    if (millis() - lastNtpTry > 10000) {
+      lastNtpTry = millis();
+      if (timeClient.forceUpdate()) {
+        if (!ntpSynced) {
+          ntpSynced = true;
+          log("NTP SYNC", timeClient.getFormattedTime());
+        } else {
+          log("NTP UPDATE", timeClient.getFormattedTime());
+        }
+      } else {
+        log("NTP FAIL", "DNS/UDP CHUA SAN SANG");
+      }
+    }
+  }
+
+  void handleOutdoorRequest() {
+    if (ROLE_PICO == 2 && mqttClient.connected()) {
+      if (millis() - lastOutdoorReq > 60000) {
+        String reqTopic = String(BUILDING_ID) + "/outdoor/request";
+        mqttClient.publish(reqTopic.c_str(), "1");
+        log("MQTT", "REQUEST OUTDOOR → " + reqTopic);
+        lastOutdoorReq = millis();
+      }
+    }
+  }
+
+  void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    String t = String(topic);
+    String msg;
+    for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+
+    log("MQTT RX", t + " = " + msg);
+
+    int p1 = t.indexOf('/');
+    int p2 = t.indexOf('/', p1 + 1);
+    int p3 = t.indexOf('/', p2 + 1);
+    int p4 = t.indexOf('/', p3 + 1);
+
+    String lvl0 = (p1 > 0) ? t.substring(0, p1) : t;
+    String lvl1 = (p1 > 0 && p2 > p1) ? t.substring(p1 + 1, p2) : "";
+    String lvl2 = (p2 > 0 && p3 > p2) ? t.substring(p2 + 1, p3) : "";
+    String lvl3 = (p3 > 0 && p4 > p3) ? t.substring(p3 + 1, p4) : "";
+    String lvl4 = (p4 > 0) ? t.substring(p4 + 1) : "";
+
+    // AC control: elb/prl/ac/<id>/<param>
+    if (lvl0 == BUILDING_ID && lvl1 == ROOM_ID && lvl2 == "ac") {
+      int acIndex = lvl3.toInt() - 1;
+      if (acIndex >= 0 && acIndex < NUM_AC) {
+        acManager.applyUserCmd(acsRef[acIndex], lvl4, msg, acIndex);
+        oled.wake();
+      }
+      return;
+    }
+
+    // Config: elb/prl/config/<param>
+    if (lvl0 == BUILDING_ID && lvl1 == ROOM_ID && lvl2 == "config") {
+      acManager.updateConfig(lvl3, msg);
+      oled.wake();
+      return;
+    }
+
+    // Outdoor temp: elb/outdoor/sensor/1/temp
+    if (lvl0 == BUILDING_ID && lvl1 == "outdoor" && lvl2 == "sensor" && lvl3 == "1" && lvl4 == "temp") {
+      acManager.setOutdoorTemp(msg.toFloat());
+      return;
+    }
+  }
+
+  static void log(const String &tag, const String &msg) {
+    Serial.print("[");
+    Serial.print(timeClient.getFormattedTime());
+    Serial.print("] ");
+    Serial.print(tag);
+    Serial.print(": ");
+    Serial.println(msg);
+  }
+
+  unsigned long lastNtpTry = 0;
+};
+
+NetworkManager* NetworkManager::instance = nullptr;
+
+// ================== WATCHDOG ==================
+void setupWatchdog() {
+  watchdog_enable(8000, 1);
+}
+
+void feedWatchdog() {
+  watchdog_update();
+}
+
+// ================== GLOBAL APP STATE ==================
 RoomConfig roomCfg = {
   BUILDING_ID,
   ROOM_ID,
@@ -115,787 +970,52 @@ RoomConfig roomCfg = {
 SensorState sensors[NUM_SENSOR];
 AcState acs[NUM_AC];
 
-// ================== IR QUEUE ==================
-struct IrTask {
-  int acIndex;
-  bool fromUser;
-  unsigned long nextTime;
-  uint8_t retry;
-};
+IrQueueManager irQueueMgr;
+OledManager oledMgr;
+SensorManager sensorMgr;
+AcManager acMgr(roomCfg, irQueueMgr);
+NetworkManager netMgr(roomCfg, sensors, acs, acMgr, oledMgr, irQueueMgr);
 
-const uint8_t IR_QUEUE_SIZE = 16;
-IrTask irQueue[IR_QUEUE_SIZE];
-uint8_t irHead = 0, irTail = 0;
-const uint32_t IR_STAGGER_MS = 5000;   // 5s giữa các lần phát IR
-
-// ================== NETWORK STATE ==================
-bool ethernetReady = false;
-bool mqttConnected = false;
-uint32_t lastMqttReconnectAttempt = 0;
-uint8_t mqttReconnectCount = 0;
-
-// ================== HEARTBEAT & OUTDOOR ==================
-uint32_t lastHeartbeat = 0;
-float outdoorTemp = 25.0f;
-float outdoorHum  = 60.0f;
-float outdoorTempBackup = NAN;
-float outdoorHumBackup  = NAN;
-unsigned long lastOutdoorReq = 0;
-
-// ================== LOG ==================
-void logMsg(const String &tag, const String &msg) {
-  Serial.print("[");
-  Serial.print(timeClient.getFormattedTime());
-  Serial.print("] ");
-  Serial.print(tag);
-  Serial.print(": ");
-  Serial.println(msg);
-}
-
-// ================== WATCHDOG ==================
-void setupWatchdog() {
-  watchdog_enable(8000, 1);
-}
-
-void feedWatchdog() {
-  watchdog_update();
-}
-
-// ================== OLED ==================
-SensorState* getActiveSensor() {
-  if (sensors[0].ok) return &sensors[0];
-  if (NUM_SENSOR > 1 && sensors[1].ok) return &sensors[1];
-  return nullptr;
-}
-
-void oledWake() {
-  if (!oledOn) {
-    oledOn = true;
-    display.ssd1306_command(SSD1306_DISPLAYON);
-    logMsg("OLED", "WAKE");
-  }
-  lastOledActivity = millis();
-}
-
-void oledMaybeSleep() {
-  if (oledOn && (millis() - lastOledActivity > OLED_TIMEOUT_MS)) {
-    oledOn = false;
-    display.clearDisplay();
-    display.display();
-    display.ssd1306_command(SSD1306_DISPLAYOFF);
-    logMsg("OLED", "SLEEP TIMEOUT");
-  }
-}
-
-void setupOled() {
-  Wire1.setSDA(6);
-  Wire1.setSCL(7);
-  Wire1.begin();
-  Wire1.setClock(400000);
-  delay(200);
-
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    logMsg("OLED", "INIT FAIL");
-    return;
-  }
-
-  oledOn = true;
-  lastOledActivity = millis();
-
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println("OLED READY");
-  display.display();
-}
-
-void updateOled(bool netStatus) {
-  if (!oledOn) return;
-
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-
-  SensorState* active = getActiveSensor();
-  float t = active ? active->temp : NAN;
-  float h = active ? active->hum  : NAN;
-
-  display.setCursor(0, 0);
-  display.print("Bld: ");
-  display.print(BUILDING_ID);
-  display.print(" Rm: ");
-  display.print(ROOM_ID);
-
-  display.setCursor(0, 12);
-  display.print("T/H: ");
-  if (!isnan(t) && !isnan(h)) {
-    display.print(t, 1);
-    display.print("C / ");
-    display.print(h, 1);
-    display.print("%");
-  } else {
-    display.print("ERR");
-  }
-
-  display.setCursor(0, 24);
-  display.print("Net: ");
-  display.print(netStatus ? "ONL" : "OFF");
-
-  display.setCursor(0, 36);
-  display.print("Time: ");
-  if (!ntpSynced)
-    display.print("WAIT NTP");
-  else
-    display.print(timeClient.getFormattedTime());
-
-  display.display();
-}
-
-// ================== ETHERNET ==================
-void setupEthernet() {
-  logMsg("ETH", "INIT...");
-  Ethernet.init(PIN_ETH_CS);
-  Ethernet.begin(mac);
-  delay(1000);
-  IPAddress ip = Ethernet.localIP();
-  if (ip[0] == 0) {
-    ethernetReady = false;
-    logMsg("ETH", "NO IP (0.0.0.0)");
-  } else {
-    ethernetReady = true;
-    logMsg("ETH", "IP = " + ip.toString());
-  }
-}
-
-// ================== MQTT ==================
-String makeClientId() {
-  String cid = "pico_";
-  cid += BUILDING_ID;
-  cid += "_";
-  cid += ROOM_ID;
-  cid += "_";
-  cid += String((uint32_t)millis(), HEX);
-  return cid;
-}
-
-String availabilityTopic() {
-  return String(BUILDING_ID) + "/" + ROOM_ID + "/pico/availability";
-}
-
-void publishAvailabilityOnline() {
-  String key = availabilityTopic();
-  mqttClient.publish(key.c_str(), "online", true);
-  logMsg("LWT", "ONLINE → " + key);
-}
-
-// Topic chuẩn mới
-String roomStateTopic() {
-  return String(BUILDING_ID) + "/" + ROOM_ID + "/state";
-}
-
-String acSetTopicBase() {
-  return String(BUILDING_ID) + "/" + ROOM_ID + "/ac/";
-}
-
-String acIrHistoryTopic(int acIndex) {
-  return String(BUILDING_ID) + "/" + ROOM_ID + "/ac/" + String(acIndex + 1) + "/ir_history";
-}
-
-String outdoorStateTopic() {
-  return String(BUILDING_ID) + "/outdoor/state";
-}
-
-String outdoorRequestTopic() {
-  return String(BUILDING_ID) + "/outdoor/request";
-}
-
-void mqttSubscribeAll() {
-  // AC control JSON: elb/prl/ac/+/set
-  String t_ac = acSetTopicBase() + "+/set";
-  mqttClient.subscribe(t_ac.c_str());
-  logMsg("MQTT SUB", t_ac);
-
-  // Config: elb/prl/config/...
-  String baseCfg = String(BUILDING_ID) + "/" + ROOM_ID + "/config/";
-  mqttClient.subscribe((baseCfg + "temp_setauto").c_str());
-  mqttClient.subscribe((baseCfg + "hum_setauto").c_str());
-  mqttClient.subscribe((baseCfg + "thr_temp").c_str());
-  logMsg("MQTT SUB", baseCfg + "temp_setauto");
-  logMsg("MQTT SUB", baseCfg + "hum_setauto");
-  logMsg("MQTT SUB", baseCfg + "thr_temp");
-
-  // Outdoor JSON: elb/outdoor/state (indoor nhận)
-  if (ROLE_PICO == 2) {
-    String t_env = outdoorStateTopic();
-    mqttClient.subscribe(t_env.c_str());
-    logMsg("MQTT SUB", t_env);
-  }
-
-  // Outdoor request: elb/outdoor/request (outdoor nhận)
-  if (ROLE_PICO == 1) {
-    String t_req = outdoorRequestTopic();
-    mqttClient.subscribe(t_req.c_str());
-    logMsg("MQTT SUB", t_req);
-  }
-}
-
-// ================== JSON HELPERS ==================
-bool parseJson(const String &payload, StaticJsonDocument<1024> &doc) {
-  DeserializationError err = deserializeJson(doc, payload);
-  if (err) {
-    logMsg("JSON ERROR", String("parse fail: ") + err.c_str());
-    return false;
-  }
-  return true;
-}
-
-// ================== MQTT CALLBACK ==================
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String t = String(topic);
-  String msg;
-  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
-
-  logMsg("MQTT RX", t + " = " + msg);
-
-  // Tách topic theo '/'
-  int p1 = t.indexOf('/');
-  int p2 = t.indexOf('/', p1 + 1);
-  int p3 = t.indexOf('/', p2 + 1);
-  int p4 = t.indexOf('/', p3 + 1);
-
-  String lvl0 = (p1 > 0) ? t.substring(0, p1) : t;
-  String lvl1 = (p1 > 0 && p2 > p1) ? t.substring(p1 + 1, p2) : "";
-  String lvl2 = (p2 > 0 && p3 > p2) ? t.substring(p2 + 1, p3) : "";
-  String lvl3 = (p3 > 0 && p4 > p3) ? t.substring(p3 + 1, p4) : "";
-  String lvl4 = (p4 > 0) ? t.substring(p4 + 1) : "";
-
-  // ================== AC CONTROL JSON: elb/prl/ac/<id>/set ==================
-  if (lvl0 == BUILDING_ID && lvl1 == ROOM_ID && lvl2 == "ac" && lvl4 == "set") {
-    int acIndex = lvl3.toInt() - 1;
-    if (acIndex >= 0 && acIndex < NUM_AC) {
-      AcState &ac = acs[acIndex];
-
-      StaticJsonDocument<512> doc;
-      if (!parseJson(msg, doc)) {
-        logMsg("JSON ERROR", "invalid control JSON for " + ac.name);
-        return;
-      }
-
-      String oldMode  = ac.mode;
-      String oldPower = ac.power;
-      float  oldCtrl  = ac.ctrl_temp;
-
-      if (doc.containsKey("opr"))       ac.opr_mode = (const char*)doc["opr"];
-      if (doc.containsKey("power"))     ac.power    = (const char*)doc["power"];
-      if (doc.containsKey("mode"))      ac.mode     = (const char*)doc["mode"];
-      if (doc.containsKey("speed"))     ac.speed    = (const char*)doc["speed"];
-      if (doc.containsKey("swing"))     ac.swing    = (const char*)doc["swing"];
-      if (doc.containsKey("brand"))     ac.fac      = (const char*)doc["brand"];
-      if (doc.containsKey("ctrl_temp")) ac.ctrl_temp = doc["ctrl_temp"].as<float>();
-
-      ac.lastUserCmdMs = millis();
-
-      if (ac.mode != oldMode || ac.power != oldPower || fabs(ac.ctrl_temp - oldCtrl) >= 0.1f) {
-        logMsg("AUTO CHANGE",
-               ac.name + " USER → opr=" + ac.opr_mode +
-               " power=" + ac.power +
-               " mode=" + ac.mode +
-               " fac=" + ac.fac +
-               " ctrl_temp=" + String(ac.ctrl_temp));
-      }
-
-      uint8_t nextTail = (irTail + 1) % IR_QUEUE_SIZE;
-      if (nextTail != irHead) {
-        irQueue[irTail].acIndex = acIndex;
-        irQueue[irTail].fromUser = true;
-        irQueue[irTail].retry = 0;
-        irQueue[irTail].nextTime = millis();
-        irTail = nextTail;
-        logMsg("IR QUEUE", "ENQUEUE USER → " + ac.name);
-      } else {
-        logMsg("IR QUEUE", "FULL (USER CMD) → BO QUA");
-      }
-
-      oledWake();
-    }
-    return;
-  }
-
-  // ================== CONFIG: elb/prl/config/<param> ==================
-  if (lvl0 == BUILDING_ID && lvl1 == ROOM_ID && lvl2 == "config") {
-    String param = lvl3;
-    if (param == "temp_setauto") {
-      float old = roomCfg.temp_setauto;
-      roomCfg.temp_setauto = msg.toFloat();
-      if (fabs(roomCfg.temp_setauto - old) >= 0.1f)
-        logMsg("AUTO CHANGE", "temp_setauto = " + String(roomCfg.temp_setauto));
-      oledWake();
-    } else if (param == "hum_setauto") {
-      float old = roomCfg.hum_setauto;
-      roomCfg.hum_setauto = msg.toFloat();
-      if (fabs(roomCfg.hum_setauto - old) >= 0.1f)
-        logMsg("AUTO CHANGE", "hum_setauto = " + String(roomCfg.hum_setauto));
-      oledWake();
-    } else if (param == "thr_temp") {
-      float old = roomCfg.thr_temp;
-      roomCfg.thr_temp = msg.toFloat();
-      if (fabs(roomCfg.thr_temp - old) >= 0.1f)
-        logMsg("AUTO CHANGE", "thr_temp = " + String(roomCfg.thr_temp));
-      oledWake();
-    }
-    return;
-  }
-
-  // ================== OUTDOOR STATE JSON: elb/outdoor/state (indoor nhận) ==================
-  if (ROLE_PICO == 2 && lvl0 == BUILDING_ID && lvl1 == "outdoor" && lvl2 == "state") {
-    StaticJsonDocument<256> doc;
-    if (!parseJson(msg, doc)) {
-      logMsg("JSON ERROR", "invalid outdoor JSON");
-      return;
-    }
-
-    float old = outdoorTemp;
-    if (doc.containsKey("temp_main"))  outdoorTemp = doc["temp_main"].as<float>();
-    if (doc.containsKey("hum_main"))   outdoorHum  = doc["hum_main"].as<float>();
-    if (doc.containsKey("temp_backup")) outdoorTempBackup = doc["temp_backup"].as<float>();
-    if (doc.containsKey("hum_backup"))  outdoorHumBackup  = doc["hum_backup"].as<float>();
-
-    if (fabs(outdoorTemp - old) >= 0.5f) {
-      logMsg("SENSOR CHANGE", "OUTDOOR TEMP = " + String(outdoorTemp));
-    }
-    return;
-  }
-
-  // ================== OUTDOOR REQUEST: elb/outdoor/request (outdoor nhận) ==================
-  if (ROLE_PICO == 1 && lvl0 == BUILDING_ID && lvl1 == "outdoor" && lvl2 == "request") {
-    logMsg("OUTDOOR", "REQUEST RECEIVED → PUBLISH STATE");
-    // sẽ publish trong hàm riêng
-    return;
-  }
-}
-
-void mqttReconnect() {
-  if (!ethernetReady) return;
-  if (mqttClient.connected()) return;
-
-  uint32_t now = millis();
-  if (now - lastMqttReconnectAttempt < 8000) return;
-  lastMqttReconnectAttempt = now;
-
-  logMsg("MQTT", "RECONNECTING...");
-
-  String clientId = makeClientId();
-  String lwtTopic = availabilityTopic();
-
-  if (mqttClient.connect(clientId.c_str(),
-                         mqtt_user, mqtt_pass,
-                         lwtTopic.c_str(), 0, true, "offline")) {
-    mqttConnected = true;
-    mqttReconnectCount = 0;
-    logMsg("MQTT", "CONNECTED");
-    publishAvailabilityOnline();
-    mqttSubscribeAll();
-    oledWake();
-  } else {
-    mqttConnected = false;
-    mqttReconnectCount++;
-    logMsg("MQTT", "FAIL (" + String(mqttReconnectCount) + ")");
-  }
-}
-
-// ================== NTP HANDLE ==================
-void handleNtp() {
-  static bool mqttWasOnline = false;
-  static unsigned long mqttOnlineAt = 0;
-
-  if (!ethernetReady) return;
-  if (!mqttClient.connected()) {
-    mqttWasOnline = false;
-    return;
-  }
-
-  if (!mqttWasOnline) {
-    mqttWasOnline = true;
-    mqttOnlineAt = millis();
-    return;
-  }
-
-  if (millis() - mqttOnlineAt < 3000) return;
-
-  if (millis() - lastNtpTry > 10000) {
-    lastNtpTry = millis();
-    if (timeClient.forceUpdate()) {
-      if (!ntpSynced) {
-        ntpSynced = true;
-        logMsg("NTP SYNC", timeClient.getFormattedTime());
-      } else {
-        logMsg("NTP UPDATE", timeClient.getFormattedTime());
-      }
-    } else {
-      logMsg("NTP FAIL", "DNS/UDP CHUA SAN SANG");
-    }
-  }
-}
-
-// ================== SENSOR ==================
+// ================== PUBLISH SENSOR ERROR ==================
 void publishSensorError() {
   String topic = String(BUILDING_ID) + "/" + ROOM_ID + "/sensor/error";
   String payload = "sensor_fail";
   if (mqttClient.connected()) {
     mqttClient.publish(topic.c_str(), payload.c_str(), true);
   }
-  logMsg("ERROR SENSOR", "PUBLISH → " + topic + " = " + payload);
-}
-
-void readSensorsOutdoor() {
-  float t1 = dht1.readTemperature();
-  float h1 = dht1.readHumidity();
-  float t2 = dht2.readTemperature();
-  float h2 = dht2.readHumidity();
-
-  sensors[0].name = "ssenv1";
-  sensors[0].temp = t1;
-  sensors[0].hum  = h1;
-  sensors[0].ok   = !isnan(t1) && !isnan(h1);
-
-  sensors[1].name = "ssenv2";
-  sensors[1].temp = t2;
-  sensors[1].hum  = h2;
-  sensors[1].ok   = !isnan(t2) && !isnan(h2);
-
-  static float lastT1 = NAN, lastH1 = NAN, lastT2 = NAN, lastH2 = NAN;
-  if (sensors[0].ok && (isnan(lastT1) || fabs(t1 - lastT1) >= 0.5f || fabs(h1 - lastH1) >= 2.0f)) {
-    logMsg("SENSOR CHANGE", "ssenv1 T=" + String(t1) + " H=" + String(h1));
-    lastT1 = t1; lastH1 = h1;
-  }
-  if (sensors[1].ok && (isnan(lastT2) || fabs(t2 - lastT2) >= 0.5f || fabs(h2 - lastH2) >= 2.0f)) {
-    logMsg("SENSOR CHANGE", "ssenv2 T=" + String(t2) + " H=" + String(h2));
-    lastT2 = t2; lastH2 = h2;
-  }
-
-  // cập nhật outdoor main/backup
-  if (sensors[0].ok) {
-    outdoorTemp = sensors[0].temp;
-    outdoorHum  = sensors[0].hum;
-  }
-  if (sensors[1].ok) {
-    outdoorTempBackup = sensors[1].temp;
-    outdoorHumBackup  = sensors[1].hum;
-  }
-}
-
-void readSensorsIndoor() {
-  float t1 = dht1.readTemperature();
-  float h1 = dht1.readHumidity();
-  sensors[0].name = "ssrom1";
-  sensors[0].temp = t1;
-  sensors[0].hum  = h1;
-  sensors[0].ok   = !isnan(t1) && !isnan(h1);
-
-  if (NUM_SENSOR > 1) {
-    float t2 = dht2.readTemperature();
-    float h2 = dht2.readHumidity();
-    sensors[1].name = "ssrom2";
-    sensors[1].temp = t2;
-    sensors[1].hum  = h2;
-    sensors[1].ok   = !isnan(t2) && !isnan(h2);
-  }
-
-  SensorState* active = getActiveSensor();
-  static float lastT = NAN, lastH = NAN;
-  if (active && active->ok) {
-    if (isnan(lastT) || fabs(active->temp - lastT) >= 0.5f ||
-        isnan(lastH) || fabs(active->hum - lastH) >= 2.0f) {
-      logMsg("SENSOR CHANGE",
-             active->name + " T=" + String(active->temp) +
-             " H=" + String(active->hum));
-      lastT = active->temp;
-      lastH = active->hum;
-    }
-  } else {
-    logMsg("ERROR SENSOR", "KHONG CO SENSOR HOP LE");
-  }
-}
-
-// ================== AUTO LOGIC ==================
-void computeAutoForAc(AcState &ac, float t_outdoor, float t_room, float h_room, int index) {
-  if (ac.opr_mode == "man") {
-    ac.sent_temp = ac.ctrl_temp;
-    return;
-  }
-
-  float oldSent = ac.sent_temp;
-  String oldMode = ac.mode;
-
-  float targetTemp = roomCfg.temp_setauto;
-  String mode = "cool";
-
-  if (t_outdoor > 27.0f) {
-    targetTemp = roomCfg.temp_setauto;
-  } else if (t_outdoor < roomCfg.thr_temp) {
-    mode = "dry";
-    targetTemp = t_outdoor + 2.0f;
-  }
-
-  if (h_room > roomCfg.hum_setauto) {
-    mode = "dry";
-  } else if (h_room < 20.0f) {
-    mode = "cool";
-  }
-
-  ac.mode = mode;
-  ac.sent_temp = targetTemp;
-
-  if (fabs(ac.sent_temp - oldSent) >= 0.5f || ac.mode != oldMode) {
-    logMsg("AUTO CHANGE",
-           ac.name + " AUTO → mode=" + ac.mode +
-           " sent_temp=" + String(ac.sent_temp) +
-           " (t_out=" + String(t_outdoor) +
-           " t_room=" + String(t_room) +
-           " h_room=" + String(h_room) + ")");
-  }
-
-  if (fabs(ac.sent_temp - oldSent) >= 0.5f) {
-    uint8_t nextTail = (irTail + 1) % IR_QUEUE_SIZE;
-    if (nextTail != irHead) {
-      irQueue[irTail].acIndex = index;
-      irQueue[irTail].fromUser = false;
-      irQueue[irTail].retry = 0;
-      irQueue[irTail].nextTime = millis();
-      irTail = nextTail;
-      logMsg("IR QUEUE", "ENQUEUE AUTO → " + ac.name);
-      ac.lastAutoIrMs = millis();
-      ac.lastAutoRoomTemp = t_room;
-    } else {
-      logMsg("IR QUEUE", "FULL (AUTO) → BO QUA");
-    }
-  }
-}
-
-// ================== IR HISTORY ==================
-void publishIrHistory(AcState &ac, int index, bool fromUser) {
-  if (!mqttClient.connected()) return;
-
-  StaticJsonDocument<256> doc;
-  doc["ts"]         = (uint32_t)(millis() / 1000);
-  doc["from_user"]  = fromUser;
-  doc["power"]      = ac.power;
-  doc["mode"]       = ac.mode;
-  doc["speed"]      = ac.speed;
-  doc["swing"]      = ac.swing;
-  doc["ctrl_temp"]  = ac.ctrl_temp;
-  doc["sent_temp"]  = ac.sent_temp;
-  doc["brand"]      = ac.fac;
-
-  char buf[256];
-  size_t len = serializeJson(doc, buf, sizeof(buf));
-
-  String topic = acIrHistoryTopic(index);
-  bool ok = mqttClient.publish(topic.c_str(), buf);
-  logMsg("IR HISTORY", String("PUBLISH → ") + topic + (ok ? " OK" : " FAIL"));
-}
-
-// ================== IR SEND ==================
-void sendIrForAc(AcState &ac, int index, bool fromUser) {
-  if (ac.power != "on") {
-    logMsg("IR SEND", ac.name + " POWER OFF → KHONG PHAT IR");
-    return;
-  }
-
-  logMsg("IR SEND",
-         ac.name + " fac=" + ac.fac +
-         " mode=" + ac.mode +
-         " temp=" + String(ac.sent_temp) +
-         " swing=" + ac.swing);
-
-  uint8_t t = (uint8_t)ac.sent_temp;
-  bool isCool = (ac.mode == "cool");
-
-  if (ac.fac == "daikin") {
-    IRDaikinESP ir(IR_PIN);
-    ir.begin();
-    ir.setPower(true);
-    ir.setTemp(t);
-    ir.setMode(isCool ? kDaikinCool : kDaikinDry);
-    ir.setFan(kDaikinFanAuto);
-    ir.setSwingVertical(ac.swing == "sw-auto" ? kDaikinSwingOn : kDaikinSwingOff);
-    ir.send();
-  } else if (ac.fac == "pana") {
-    IRPanasonicAc ir(IR_PIN);
-    ir.begin();
-    ir.setPower(true);
-    ir.setTemp(t);
-    ir.setMode(isCool ? kPanasonicAcCool : kPanasonicAcDry);
-    ir.setFan(kPanasonicAcFanAuto);
-    ir.setSwingVertical(ac.swing == "sw-auto");
-    ir.send();
-  } else if (ac.fac == "lg") {
-    IRLgAc ir(IR_PIN);
-    ir.begin();
-    ir.setPower(true);
-    ir.setTemp(t);
-    ir.setMode(isCool ? kLgAcCool : kLgAcDry);
-    ir.setFan(kLgAcFanAuto);
-    ir.send();
-  } else if (ac.fac == "mitsu") {
-    IRMitsubishiAC ir(IR_PIN);
-    ir.begin();
-    ir.setPower(true);
-    ir.setTemp(t);
-    ir.setMode(isCool ? kMitsubishiAcCool : kMitsubishiAcDry);
-    ir.setFan(kMitsubishiAcFanAuto);
-    ir.setVane(kMitsubishiAcVaneAuto);
-    ir.send();
-  } else if (ac.fac == "casper") {
-    logMsg("IR SEND", "Casper: CHUA CO MA RAW, CAN BO SUNG SAU");
-  } else {
-    logMsg("IR SEND", "HANG KHONG HO TRO: " + ac.fac);
-  }
-
-  // publish IR history
-  publishIrHistory(ac, index, fromUser);
-}
-
-// ================== IR QUEUE PROCESS ==================
-void processIrQueue() {
-  if (irHead == irTail) return;
-
-  IrTask &task = irQueue[irHead];
-  if (millis() < task.nextTime) return;
-
-  logMsg("IR QUEUE",
-         "PROCESS acIndex=" + String(task.acIndex) +
-         " retry=" + String(task.retry) +
-         " fromUser=" + String(task.fromUser ? "Y" : "N"));
-
-  sendIrForAc(acs[task.acIndex], task.acIndex, task.fromUser);
-
-  task.retry++;
-  if (task.retry < 2) {
-    task.nextTime = millis() + IR_STAGGER_MS;
-    logMsg("IR QUEUE", "SCHEDULE NEXT RETRY SAU 5s");
-  } else {
-    irHead = (irHead + 1) % IR_QUEUE_SIZE;
-    logMsg("IR QUEUE", "DONE TASK → POP");
-  }
-}
-
-// ================== JSON PUB ==================
-void publishRoomState() {
-  StaticJsonDocument<4096> doc;
-
-  // Sensors → temp_1, hum_1, temp_2, hum_2
-  if (NUM_SENSOR > 0) {
-    doc["temp_1"] = sensors[0].temp;
-    doc["hum_1"]  = sensors[0].hum;
-  }
-  if (NUM_SENSOR > 1) {
-    doc["temp_2"] = sensors[1].temp;
-    doc["hum_2"]  = sensors[1].hum;
-  }
-
-  // ACs → ac1, ac2, ...
-  for (int i = 0; i < NUM_AC; i++) {
-    String key = "ac" + String(i + 1);
-    JsonObject o = doc.createNestedObject(key);
-    o["opr"]       = acs[i].opr_mode;
-    o["power"]     = acs[i].power;
-    o["mode"]      = acs[i].mode;
-    o["speed"]     = acs[i].speed;
-    o["swing"]     = acs[i].swing;
-    o["brand"]     = acs[i].fac;
-    o["ctrl_temp"] = acs[i].ctrl_temp;
-    o["sent_temp"] = acs[i].sent_temp;
-  }
-
-  // Config
-  JsonObject cfg = doc.createNestedObject("cfg");
-  cfg["temp_setauto"] = roomCfg.temp_setauto;
-  cfg["hum_setauto"]  = roomCfg.hum_setauto;
-  cfg["thr_temp"]     = roomCfg.thr_temp;
-
-  char buffer[4096];
-  size_t len = serializeJson(doc, buffer, sizeof(buffer));
-
-  String topic = roomStateTopic();
-
-  if (!mqttClient.connected()) {
-    logMsg("MQTT", "OFFLINE → KHONG GUI JSON");
-    return;
-  }
-
-  bool ok = mqttClient.publish(topic.c_str(), buffer);
-  logMsg("MQTT", String("PUBLISH STATE → ") + (ok ? "OK" : "FAIL"));
-}
-
-// ================== OUTDOOR JSON PUB ==================
-void publishOutdoorState() {
-  if (!mqttClient.connected()) return;
-
-  StaticJsonDocument<512> doc;
-  doc["temp_main"]   = outdoorTemp;
-  doc["hum_main"]    = outdoorHum;
-  doc["temp_backup"] = outdoorTempBackup;
-  doc["hum_backup"]  = outdoorHumBackup;
-
-  char buf[512];
-  size_t len = serializeJson(doc, buf, sizeof(buf));
-
-  String topic = outdoorStateTopic();
-  bool ok = mqttClient.publish(topic.c_str(), buf);
-  logMsg("OUTDOOR", String("PUBLISH STATE → ") + (ok ? "OK" : "FAIL"));
-}
-
-// ================== SETUP SENSORS & AC ==================
-void setupSensors() {
-  dht1.begin();
-  if (NUM_SENSOR > 1) dht2.begin();
-}
-
-void setupAcs() {
-  for (int i = 0; i < NUM_AC; i++) {
-    acs[i].name      = "ac" + String(i + 1);
-    acs[i].opr_mode  = "auto";
-    acs[i].power     = "off";
-    acs[i].mode      = "cool";
-    acs[i].speed     = "auto";
-    acs[i].swing     = "sw-auto";
-    acs[i].fac       = "daikin";
-    acs[i].ctrl_temp = 27.0f;
-    acs[i].sent_temp = 27.0f;
-    acs[i].prev_sent_temp = 27.0f;
-    acs[i].lastUserCmdMs = 0;
-    acs[i].lastAutoIrMs = 0;
-    acs[i].lastAutoRoomTemp = NAN;
-  }
+  Serial.print("[");
+  Serial.print(timeClient.getFormattedTime());
+  Serial.print("] ");
+  Serial.print("ERROR SENSOR");
+  Serial.print(": ");
+  Serial.print("PUBLISH → ");
+  Serial.print(topic);
+  Serial.print(" = ");
+  Serial.println(payload);
 }
 
 // ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
   delay(2000);
-  Serial.println("===== PICO BMS v2 (MQTT JSON, NET + MQTT + NTP + IR SAFE) =====");
+  Serial.println("===== PICO BMS OOP (NET + MQTT + NTP + IR SAFE, JSON STATE) =====");
 
   setupWatchdog();
-  setupEthernet();
 
-  mqttClient.setServer(mqtt_server, mqtt_port);
-  mqttClient.setCallback(mqttCallback);
+  NetworkManager::instance = &netMgr;
 
-  setupSensors();
-  setupAcs();
-  setupOled();
+  netMgr.setup();
+  sensorMgr.setup();
+  acMgr.setup(acs);
+  oledMgr.setup();
 
   irsend.begin();
-  timeClient.begin();
 }
 
 // ================== LOOP ==================
 void loop() {
   feedWatchdog();
 
-  // Heartbeat đơn giản
   static unsigned long lastBeat = 0;
   if (millis() - lastBeat > 2000) {
     lastBeat = millis();
@@ -903,148 +1023,48 @@ void loop() {
     Serial.println(millis());
   }
 
-  // Ethernet link
-  if (Ethernet.linkStatus() == LinkOFF) {
-    if (ethernetReady) {
-      ethernetReady = false;
-      logMsg("ETH", "LINK OFF");
-    }
-  } else {
-    if (!ethernetReady) {
-      logMsg("ETH", "LINK ON → REINIT");
-      setupEthernet();
-      oledWake();
-    }
-  }
+  netMgr.loop();
 
-  // MQTT
-  bool prevConn = mqttConnected;
-  if (!mqttClient.connected()) {
-    mqttReconnect();
-  }
-  mqttClient.loop();
-  mqttConnected = mqttClient.connected();
-  if (!mqttConnected && prevConn) {
-    logMsg("MQTT", "DISCONNECTED SAU LOOP");
-  }
-
-  // NTP
-  handleNtp();
-
-  // NET CHANGE
-  bool netStatus = mqttClient.connected();
-  static bool lastNet = false;
-  if (netStatus != lastNet) {
-    lastNet = netStatus;
-    logMsg("NET CHANGE", netStatus ? "ONLINE" : "OFFLINE");
-    oledWake();
-  }
-
-  // OUTDOOR REQUEST (indoor → outdoor)
-  if (ROLE_PICO == 2 && mqttClient.connected()) {
-    if (millis() - lastOutdoorReq > 60000) {
-      String reqTopic = outdoorRequestTopic();
-      mqttClient.publish(reqTopic.c_str(), "1");
-      logMsg("MQTT", "REQUEST OUTDOOR → " + reqTopic);
-      lastOutdoorReq = millis();
-    }
-  }
-
-  // Read sensors
   if (ROLE_PICO == 1) {
-    readSensorsOutdoor();
+    sensorMgr.readOutdoor(sensors);
   } else {
-    readSensorsIndoor();
+    sensorMgr.readIndoor(sensors);
   }
 
-  // Auto-failover sensor cho phòng chỉ có 1 sensor
-  if (ROLE_PICO == 2 && NUM_SENSOR == 1 && !sensors[0].ok) {
-    logMsg("ERROR SENSOR", "ssrom1 FAIL → DUNG AC");
+  SensorState* active = sensorMgr.getActiveSensor(sensors);
+
+  if (ROLE_PICO == 2 && NUM_SENSOR == 1 && (!active || !active->ok)) {
+    Serial.print("[");
+    Serial.print(timeClient.getFormattedTime());
+    Serial.print("] ");
+    Serial.println("ERROR SENSOR: ssrom1 FAIL → DUNG AC");
     publishSensorError();
     for (int i = 0; i < NUM_AC; i++) {
       acs[i].power = "off";
     }
-    updateOled(netStatus);
-    oledMaybeSleep();
+    oledMgr.update(netMgr.isMqttConnected(), active, netMgr.isNtpSynced());
+    oledMgr.maybeSleep();
     delay(500);
     return;
   }
 
-  // Sự kiện nhiệt độ thay đổi ≥1°C → wake OLED
-  SensorState* active = getActiveSensor();
   if (active && !isnan(active->temp)) {
-    if (isnan(lastDisplayedTemp) || fabs(active->temp - lastDisplayedTemp) >= 1.0f) {
-      logMsg("SENSOR CHANGE", "ROOM TEMP Δ≥1C → WAKE OLED");
-      lastDisplayedTemp = active->temp;
-      oledWake();
-    }
+    oledMgr.onTempChangeWake(active->temp);
   }
 
-  // Indoor logic + IR queue
   if (ROLE_PICO == 2) {
-    if (active && active->ok) {
-      float t_room = active->temp;
-      float h_room = active->hum;
-      float t_outdoor = outdoorTemp;
-
-      for (int i = 0; i < NUM_AC; i++) {
-        acs[i].prev_sent_temp = acs[i].sent_temp;
-        computeAutoForAc(acs[i], t_outdoor, t_room, h_room, i);
-      }
-
-      // AUTO-ADJUST sau 5 phút nếu phòng không mát
-      unsigned long now = millis();
-      for (int i = 0; i < NUM_AC; i++) {
-        AcState &ac = acs[i];
-        if (ac.opr_mode == "auto" && ac.power == "on") {
-          if (ac.lastAutoIrMs > 0 && (now - ac.lastAutoIrMs > 300000)) { // 5 phút
-            if (!isnan(ac.lastAutoRoomTemp) &&
-                fabs(t_room - ac.lastAutoRoomTemp) < 0.5f) {
-              ac.sent_temp -= 1.0f;
-              logMsg("AUTO CHANGE",
-                     ac.name + " AUTO-ADJUST → giam 1C, sent_temp=" +
-                     String(ac.sent_temp));
-
-              uint8_t nextTail = (irTail + 1) % IR_QUEUE_SIZE;
-              if (nextTail != irHead) {
-                irQueue[irTail].acIndex = i;
-                irQueue[irTail].fromUser = false;
-                irQueue[irTail].retry = 0;
-                irQueue[irTail].nextTime = millis();
-                irTail = nextTail;
-                logMsg("IR QUEUE", "ENQUEUE AUTO-ADJUST → " + ac.name);
-                ac.lastAutoIrMs = millis();
-                ac.lastAutoRoomTemp = t_room;
-              } else {
-                logMsg("IR QUEUE", "FULL (AUTO-ADJUST) → BO QUA");
-              }
-            } else {
-              ac.lastAutoIrMs = now;
-              ac.lastAutoRoomTemp = t_room;
-            }
-          }
-        }
-      }
-    }
-
-    processIrQueue();
+    acMgr.computeAuto(acs, active);
+    irQueueMgr.process(acs, [](AcState &ac) {
+      acMgr.sendIr(ac);
+    });
   }
 
-  // Publish state mỗi 20s (indoor)
   static uint32_t lastPub = 0;
-  if (ROLE_PICO == 2 && millis() - lastPub > 20000) {
+  if (millis() - lastPub > 20000) {
     lastPub = millis();
-    publishRoomState();
+    netMgr.publishRoomState();
   }
 
-  // Publish outdoor mỗi 20s (outdoor)
-  static uint32_t lastOutdoorPub = 0;
-  if (ROLE_PICO == 1 && millis() - lastOutdoorPub > 20000) {
-    lastOutdoorPub = millis();
-    publishOutdoorState();
-  }
-
-  // OLED
-  updateOled(netStatus);
-  oledMaybeSleep();
+  oledMgr.update(netMgr.isMqttConnected(), active, netMgr.isNtpSynced());
+  oledMgr.maybeSleep();
 }

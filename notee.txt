@@ -1,0 +1,22 @@
+🟦 Khi làm việc ở công ty:
+1) Trước khi code:
+
+git pull
+
+2) Sau khi code xong:
+
+git add .
+git commit -m "Thay doi"
+git push
+
+
+🟩 Khi làm việc ở nhà:
+1) Trước khi code:
+
+git pull
+
+2) Sau khi code xong:
+
+git add .
+git commit -m "Update code ve may"
+git push
