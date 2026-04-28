@@ -83,7 +83,7 @@ struct AcState {
   String name;
   String opr_mode;      // auto / man
   String power;         // on / off
-  String mode;          // cool / dry
+  String mode;          // cool / dry / auto / fan / heat
   String speed;
   String swing;
   String fac;           // daikin / pana / lg / mitsu / casper
@@ -137,6 +137,9 @@ uint8_t mqttReconnectCount = 0;
 // ================== HEARTBEAT & OUTDOOR ==================
 uint32_t lastHeartbeat = 0;
 float outdoorTemp = 25.0f;
+float outdoorHum  = 60.0f;
+float outdoorTempBackup = NAN;
+float outdoorHumBackup  = NAN;
 unsigned long lastOutdoorReq = 0;
 
 // ================== LOG ==================
@@ -286,9 +289,30 @@ void publishAvailabilityOnline() {
   logMsg("LWT", "ONLINE → " + key);
 }
 
+// Topic chuẩn mới
+String roomStateTopic() {
+  return String(BUILDING_ID) + "/" + ROOM_ID + "/state";
+}
+
+String acSetTopicBase() {
+  return String(BUILDING_ID) + "/" + ROOM_ID + "/ac/";
+}
+
+String acIrHistoryTopic(int acIndex) {
+  return String(BUILDING_ID) + "/" + ROOM_ID + "/ac/" + String(acIndex + 1) + "/ir_history";
+}
+
+String outdoorStateTopic() {
+  return String(BUILDING_ID) + "/outdoor/state";
+}
+
+String outdoorRequestTopic() {
+  return String(BUILDING_ID) + "/outdoor/request";
+}
+
 void mqttSubscribeAll() {
-  // AC control: elb/prl/ac/+/#
-  String t_ac = String(BUILDING_ID) + "/" + ROOM_ID + "/ac/+/+";
+  // AC control JSON: elb/prl/ac/+/set
+  String t_ac = acSetTopicBase() + "+/set";
   mqttClient.subscribe(t_ac.c_str());
   logMsg("MQTT SUB", t_ac);
 
@@ -301,12 +325,32 @@ void mqttSubscribeAll() {
   logMsg("MQTT SUB", baseCfg + "hum_setauto");
   logMsg("MQTT SUB", baseCfg + "thr_temp");
 
-  // Outdoor temp: elb/outdoor/sensor/1/temp
-  String t_env = String(BUILDING_ID) + "/outdoor/sensor/1/temp";
-  mqttClient.subscribe(t_env.c_str());
-  logMsg("MQTT SUB", t_env);
+  // Outdoor JSON: elb/outdoor/state (indoor nhận)
+  if (ROLE_PICO == 2) {
+    String t_env = outdoorStateTopic();
+    mqttClient.subscribe(t_env.c_str());
+    logMsg("MQTT SUB", t_env);
+  }
+
+  // Outdoor request: elb/outdoor/request (outdoor nhận)
+  if (ROLE_PICO == 1) {
+    String t_req = outdoorRequestTopic();
+    mqttClient.subscribe(t_req.c_str());
+    logMsg("MQTT SUB", t_req);
+  }
 }
 
+// ================== JSON HELPERS ==================
+bool parseJson(const String &payload, StaticJsonDocument<1024> &doc) {
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    logMsg("JSON ERROR", String("parse fail: ") + err.c_str());
+    return false;
+  }
+  return true;
+}
+
+// ================== MQTT CALLBACK ==================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String t = String(topic);
   String msg;
@@ -315,8 +359,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   logMsg("MQTT RX", t + " = " + msg);
 
   // Tách topic theo '/'
-  // Ví dụ: elb/prl/ac/1/power
-  //        0   1   2  3  4
   int p1 = t.indexOf('/');
   int p2 = t.indexOf('/', p1 + 1);
   int p3 = t.indexOf('/', p2 + 1);
@@ -328,32 +370,29 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String lvl3 = (p3 > 0 && p4 > p3) ? t.substring(p3 + 1, p4) : "";
   String lvl4 = (p4 > 0) ? t.substring(p4 + 1) : "";
 
-  // AC control: elb/prl/ac/<id>/<param>
-  if (lvl0 == BUILDING_ID && lvl1 == ROOM_ID && lvl2 == "ac") {
+  // ================== AC CONTROL JSON: elb/prl/ac/<id>/set ==================
+  if (lvl0 == BUILDING_ID && lvl1 == ROOM_ID && lvl2 == "ac" && lvl4 == "set") {
     int acIndex = lvl3.toInt() - 1;
     if (acIndex >= 0 && acIndex < NUM_AC) {
       AcState &ac = acs[acIndex];
 
-      String param = lvl4;
-      String oldMode = ac.mode;
-      String oldPower = ac.power;
-      float oldCtrl = ac.ctrl_temp;
-
-      if (param == "opr") {
-        ac.opr_mode = msg;
-      } else if (param == "power") {
-        ac.power = msg;
-      } else if (param == "mode") {
-        ac.mode = msg;
-      } else if (param == "speed") {
-        ac.speed = msg;
-      } else if (param == "swing") {
-        ac.swing = msg;
-      } else if (param == "fac") {
-        ac.fac = msg;
-      } else if (param == "ctrl_temp") {
-        ac.ctrl_temp = msg.toFloat();
+      StaticJsonDocument<512> doc;
+      if (!parseJson(msg, doc)) {
+        logMsg("JSON ERROR", "invalid control JSON for " + ac.name);
+        return;
       }
+
+      String oldMode  = ac.mode;
+      String oldPower = ac.power;
+      float  oldCtrl  = ac.ctrl_temp;
+
+      if (doc.containsKey("opr"))       ac.opr_mode = (const char*)doc["opr"];
+      if (doc.containsKey("power"))     ac.power    = (const char*)doc["power"];
+      if (doc.containsKey("mode"))      ac.mode     = (const char*)doc["mode"];
+      if (doc.containsKey("speed"))     ac.speed    = (const char*)doc["speed"];
+      if (doc.containsKey("swing"))     ac.swing    = (const char*)doc["swing"];
+      if (doc.containsKey("brand"))     ac.fac      = (const char*)doc["brand"];
+      if (doc.containsKey("ctrl_temp")) ac.ctrl_temp = doc["ctrl_temp"].as<float>();
 
       ac.lastUserCmdMs = millis();
 
@@ -383,7 +422,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  // Config: elb/prl/config/<param>
+  // ================== CONFIG: elb/prl/config/<param> ==================
   if (lvl0 == BUILDING_ID && lvl1 == ROOM_ID && lvl2 == "config") {
     String param = lvl3;
     if (param == "temp_setauto") {
@@ -408,12 +447,30 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  // Outdoor temp: elb/outdoor/sensor/1/temp
-  if (lvl0 == BUILDING_ID && lvl1 == "outdoor" && lvl2 == "sensor" && lvl3 == "1" && lvl4 == "temp") {
+  // ================== OUTDOOR STATE JSON: elb/outdoor/state (indoor nhận) ==================
+  if (ROLE_PICO == 2 && lvl0 == BUILDING_ID && lvl1 == "outdoor" && lvl2 == "state") {
+    StaticJsonDocument<256> doc;
+    if (!parseJson(msg, doc)) {
+      logMsg("JSON ERROR", "invalid outdoor JSON");
+      return;
+    }
+
     float old = outdoorTemp;
-    outdoorTemp = msg.toFloat();
-    if (fabs(outdoorTemp - old) >= 0.5f)
+    if (doc.containsKey("temp_main"))  outdoorTemp = doc["temp_main"].as<float>();
+    if (doc.containsKey("hum_main"))   outdoorHum  = doc["hum_main"].as<float>();
+    if (doc.containsKey("temp_backup")) outdoorTempBackup = doc["temp_backup"].as<float>();
+    if (doc.containsKey("hum_backup"))  outdoorHumBackup  = doc["hum_backup"].as<float>();
+
+    if (fabs(outdoorTemp - old) >= 0.5f) {
       logMsg("SENSOR CHANGE", "OUTDOOR TEMP = " + String(outdoorTemp));
+    }
+    return;
+  }
+
+  // ================== OUTDOOR REQUEST: elb/outdoor/request (outdoor nhận) ==================
+  if (ROLE_PICO == 1 && lvl0 == BUILDING_ID && lvl1 == "outdoor" && lvl2 == "request") {
+    logMsg("OUTDOOR", "REQUEST RECEIVED → PUBLISH STATE");
+    // sẽ publish trong hàm riêng
     return;
   }
 }
@@ -438,7 +495,7 @@ void mqttReconnect() {
     mqttReconnectCount = 0;
     logMsg("MQTT", "CONNECTED");
     publishAvailabilityOnline();
-    if (ROLE_PICO == 2) mqttSubscribeAll();
+    mqttSubscribeAll();
     oledWake();
   } else {
     mqttConnected = false;
@@ -515,6 +572,16 @@ void readSensorsOutdoor() {
   if (sensors[1].ok && (isnan(lastT2) || fabs(t2 - lastT2) >= 0.5f || fabs(h2 - lastH2) >= 2.0f)) {
     logMsg("SENSOR CHANGE", "ssenv2 T=" + String(t2) + " H=" + String(h2));
     lastT2 = t2; lastH2 = h2;
+  }
+
+  // cập nhật outdoor main/backup
+  if (sensors[0].ok) {
+    outdoorTemp = sensors[0].temp;
+    outdoorHum  = sensors[0].hum;
+  }
+  if (sensors[1].ok) {
+    outdoorTempBackup = sensors[1].temp;
+    outdoorHumBackup  = sensors[1].hum;
   }
 }
 
@@ -606,8 +673,31 @@ void computeAutoForAc(AcState &ac, float t_outdoor, float t_room, float h_room, 
   }
 }
 
+// ================== IR HISTORY ==================
+void publishIrHistory(AcState &ac, int index, bool fromUser) {
+  if (!mqttClient.connected()) return;
+
+  StaticJsonDocument<256> doc;
+  doc["ts"]         = (uint32_t)(millis() / 1000);
+  doc["from_user"]  = fromUser;
+  doc["power"]      = ac.power;
+  doc["mode"]       = ac.mode;
+  doc["speed"]      = ac.speed;
+  doc["swing"]      = ac.swing;
+  doc["ctrl_temp"]  = ac.ctrl_temp;
+  doc["sent_temp"]  = ac.sent_temp;
+  doc["brand"]      = ac.fac;
+
+  char buf[256];
+  size_t len = serializeJson(doc, buf, sizeof(buf));
+
+  String topic = acIrHistoryTopic(index);
+  bool ok = mqttClient.publish(topic.c_str(), buf);
+  logMsg("IR HISTORY", String("PUBLISH → ") + topic + (ok ? " OK" : " FAIL"));
+}
+
 // ================== IR SEND ==================
-void sendIrForAc(AcState &ac) {
+void sendIrForAc(AcState &ac, int index, bool fromUser) {
   if (ac.power != "on") {
     logMsg("IR SEND", ac.name + " POWER OFF → KHONG PHAT IR");
     return;
@@ -631,10 +721,7 @@ void sendIrForAc(AcState &ac) {
     ir.setFan(kDaikinFanAuto);
     ir.setSwingVertical(ac.swing == "sw-auto" ? kDaikinSwingOn : kDaikinSwingOff);
     ir.send();
-    return;
-  }
-
-  if (ac.fac == "pana") {
+  } else if (ac.fac == "pana") {
     IRPanasonicAc ir(IR_PIN);
     ir.begin();
     ir.setPower(true);
@@ -643,10 +730,7 @@ void sendIrForAc(AcState &ac) {
     ir.setFan(kPanasonicAcFanAuto);
     ir.setSwingVertical(ac.swing == "sw-auto");
     ir.send();
-    return;
-  }
-
-  if (ac.fac == "lg") {
+  } else if (ac.fac == "lg") {
     IRLgAc ir(IR_PIN);
     ir.begin();
     ir.setPower(true);
@@ -654,10 +738,7 @@ void sendIrForAc(AcState &ac) {
     ir.setMode(isCool ? kLgAcCool : kLgAcDry);
     ir.setFan(kLgAcFanAuto);
     ir.send();
-    return;
-  }
-
-  if (ac.fac == "mitsu") {
+  } else if (ac.fac == "mitsu") {
     IRMitsubishiAC ir(IR_PIN);
     ir.begin();
     ir.setPower(true);
@@ -666,15 +747,14 @@ void sendIrForAc(AcState &ac) {
     ir.setFan(kMitsubishiAcFanAuto);
     ir.setVane(kMitsubishiAcVaneAuto);
     ir.send();
-    return;
-  }
-
-  if (ac.fac == "casper") {
+  } else if (ac.fac == "casper") {
     logMsg("IR SEND", "Casper: CHUA CO MA RAW, CAN BO SUNG SAU");
-    return;
+  } else {
+    logMsg("IR SEND", "HANG KHONG HO TRO: " + ac.fac);
   }
 
-  logMsg("IR SEND", "HANG KHONG HO TRO: " + ac.fac);
+  // publish IR history
+  publishIrHistory(ac, index, fromUser);
 }
 
 // ================== IR QUEUE PROCESS ==================
@@ -689,7 +769,7 @@ void processIrQueue() {
          " retry=" + String(task.retry) +
          " fromUser=" + String(task.fromUser ? "Y" : "N"));
 
-  sendIrForAc(acs[task.acIndex]);
+  sendIrForAc(acs[task.acIndex], task.acIndex, task.fromUser);
 
   task.retry++;
   if (task.retry < 2) {
@@ -705,29 +785,31 @@ void processIrQueue() {
 void publishRoomState() {
   StaticJsonDocument<4096> doc;
 
-  JsonArray jsSensors = doc.createNestedArray("sensors");
-  for (int i = 0; i < NUM_SENSOR; i++) {
-    JsonObject o = jsSensors.createNestedObject();
-    o["name"] = sensors[i].name;
-    o["temp"] = sensors[i].temp;
-    o["hum"]  = sensors[i].hum;
-    o["ok"]   = sensors[i].ok;
+  // Sensors → temp_1, hum_1, temp_2, hum_2
+  if (NUM_SENSOR > 0) {
+    doc["temp_1"] = sensors[0].temp;
+    doc["hum_1"]  = sensors[0].hum;
+  }
+  if (NUM_SENSOR > 1) {
+    doc["temp_2"] = sensors[1].temp;
+    doc["hum_2"]  = sensors[1].hum;
   }
 
-  JsonArray jsAcs = doc.createNestedArray("acs");
+  // ACs → ac1, ac2, ...
   for (int i = 0; i < NUM_AC; i++) {
-    JsonObject o = jsAcs.createNestedObject();
-    o["name"]      = acs[i].name;
+    String key = "ac" + String(i + 1);
+    JsonObject o = doc.createNestedObject(key);
     o["opr"]       = acs[i].opr_mode;
     o["power"]     = acs[i].power;
     o["mode"]      = acs[i].mode;
     o["speed"]     = acs[i].speed;
     o["swing"]     = acs[i].swing;
-    o["fac"]       = acs[i].fac;
+    o["brand"]     = acs[i].fac;
     o["ctrl_temp"] = acs[i].ctrl_temp;
     o["sent_temp"] = acs[i].sent_temp;
   }
 
+  // Config
   JsonObject cfg = doc.createNestedObject("cfg");
   cfg["temp_setauto"] = roomCfg.temp_setauto;
   cfg["hum_setauto"]  = roomCfg.hum_setauto;
@@ -736,7 +818,7 @@ void publishRoomState() {
   char buffer[4096];
   size_t len = serializeJson(doc, buffer, sizeof(buffer));
 
-  String topic = String(BUILDING_ID) + "/" + ROOM_ID + "/state";
+  String topic = roomStateTopic();
 
   if (!mqttClient.connected()) {
     logMsg("MQTT", "OFFLINE → KHONG GUI JSON");
@@ -745,6 +827,24 @@ void publishRoomState() {
 
   bool ok = mqttClient.publish(topic.c_str(), buffer);
   logMsg("MQTT", String("PUBLISH STATE → ") + (ok ? "OK" : "FAIL"));
+}
+
+// ================== OUTDOOR JSON PUB ==================
+void publishOutdoorState() {
+  if (!mqttClient.connected()) return;
+
+  StaticJsonDocument<512> doc;
+  doc["temp_main"]   = outdoorTemp;
+  doc["hum_main"]    = outdoorHum;
+  doc["temp_backup"] = outdoorTempBackup;
+  doc["hum_backup"]  = outdoorHumBackup;
+
+  char buf[512];
+  size_t len = serializeJson(doc, buf, sizeof(buf));
+
+  String topic = outdoorStateTopic();
+  bool ok = mqttClient.publish(topic.c_str(), buf);
+  logMsg("OUTDOOR", String("PUBLISH STATE → ") + (ok ? "OK" : "FAIL"));
 }
 
 // ================== SETUP SENSORS & AC ==================
@@ -775,7 +875,7 @@ void setupAcs() {
 void setup() {
   Serial.begin(115200);
   delay(2000);
-  Serial.println("===== PICO BMS (NET + MQTT + NTP + IR SAFE, TREE TOPIC) =====");
+  Serial.println("===== PICO BMS v2 (MQTT JSON, NET + MQTT + NTP + IR SAFE) =====");
 
   setupWatchdog();
   setupEthernet();
@@ -840,10 +940,10 @@ void loop() {
     oledWake();
   }
 
-  // SUB/REQ outdoor mỗi 1 phút
+  // OUTDOOR REQUEST (indoor → outdoor)
   if (ROLE_PICO == 2 && mqttClient.connected()) {
     if (millis() - lastOutdoorReq > 60000) {
-      String reqTopic = String(BUILDING_ID) + "/outdoor/request";
+      String reqTopic = outdoorRequestTopic();
       mqttClient.publish(reqTopic.c_str(), "1");
       logMsg("MQTT", "REQUEST OUTDOOR → " + reqTopic);
       lastOutdoorReq = millis();
@@ -930,11 +1030,18 @@ void loop() {
     processIrQueue();
   }
 
-  // Publish state mỗi 20s
+  // Publish state mỗi 20s (indoor)
   static uint32_t lastPub = 0;
-  if (millis() - lastPub > 20000) {
+  if (ROLE_PICO == 2 && millis() - lastPub > 20000) {
     lastPub = millis();
     publishRoomState();
+  }
+
+  // Publish outdoor mỗi 20s (outdoor)
+  static uint32_t lastOutdoorPub = 0;
+  if (ROLE_PICO == 1 && millis() - lastOutdoorPub > 20000) {
+    lastOutdoorPub = millis();
+    publishOutdoorState();
   }
 
   // OLED
