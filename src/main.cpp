@@ -20,9 +20,11 @@
 #include <EthernetUdp.h>
 #include <NTPClient.h>
 #include "hardware/watchdog.h"
+//Biến gọi debug monitor - giảm quá tải cpu do monitor quá nhiều
+#define DEBUG 0
 
 // ================== CẤU HÌNH CHUNG ==================
-#define ROLE_PICO 2                 // 1 = outdoor, 2 = indoor
+#define ROLE_PICO 2
 #define BUILDING_ID "elb"
 #define ROOM_ID     "prl"
 #define NUM_AC      6
@@ -32,7 +34,7 @@
 const char* mqtt_server = "103.82.194.179";
 const uint16_t mqtt_port = 1883;
 const char* mqtt_user = "hnnam46";
-const char* mqtt_pass = "Namnam123";
+const char* mqtt_pass = "Namnam123@";
 
 // ================== ETHERNET ==================
 #define PIN_ETH_CS 17
@@ -56,10 +58,10 @@ Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire1, -1);
 #define IR_PIN 3
 IRsend irsend(IR_PIN);
 
-// ================== NTP (Google) ==================
+// ================== NTP ==================
 EthernetUDP ntpUDP;
 const char* ntpServer = "time.google.com";
-NTPClient timeClient(ntpUDP, ntpServer, 25200, 60000); // UTC+7
+NTPClient timeClient(ntpUDP, ntpServer, 25200, 60000);
 
 // ================== STRUCT ==================
 struct SensorState {
@@ -71,15 +73,15 @@ struct SensorState {
 
 struct AcState {
   String name;
-  String opr_mode;      // auto / man
-  String power;         // on / off
-  String mode;          // cool / dry
+  String opr_mode;
+  String power;
+  String mode;
   String speed;
   String swing;
-  String fac;           // daikin / pana / lg / mitsu / casper
-  float  ctrl_temp;     // nhiệt độ do HA gửi
-  float  sent_temp;     // nhiệt độ sẽ phát IR
-  float  prev_sent_temp;
+  String fac;
+  float ctrl_temp;
+  float sent_temp;
+  float prev_sent_temp;
 
   unsigned long lastUserCmdMs;
   unsigned long lastAutoIrMs;
@@ -364,7 +366,6 @@ private:
     Serial.println(msg);
   }
 };
-
 // ================== AC MANAGER ==================
 class AcManager {
 public:
@@ -404,22 +405,24 @@ public:
     unsigned long now = millis();
     for (int i = 0; i < NUM_AC; i++) {
       AcState &ac = acs[i];
+
       if (ac.opr_mode == "auto" && ac.power == "on") {
+
+        // ================== IR FAIL CHECK 5 PHÚT ==================
         if (ac.lastAutoIrMs > 0 && (now - ac.lastAutoIrMs > 300000)) {
           if (!isnan(ac.lastAutoRoomTemp) &&
               fabs(t_room - ac.lastAutoRoomTemp) < 0.5f) {
-            ac.sent_temp -= 1.0f;
-            log("AUTO CHANGE",
-                ac.name + " AUTO-ADJUST → giam 1C, sent_temp=" +
-                String(ac.sent_temp));
 
-            irQueue.enqueue(i, false);
-            ac.lastAutoIrMs = millis();
-            ac.lastAutoRoomTemp = t_room;
-          } else {
-            ac.lastAutoIrMs = now;
-            ac.lastAutoRoomTemp = t_room;
+            String errTopic = String(BUILDING_ID) + "/" + ROOM_ID +
+                              "/ac/" + String(i + 1) + "/error";
+
+            mqttClient.publish(errTopic.c_str(), "ir_fail", true);
+
+            log("IR FAIL", ac.name + " KHONG THAY DOI NHIET DO SAU 5 PHÚT");
           }
+
+          ac.lastAutoIrMs = now;
+          ac.lastAutoRoomTemp = t_room;
         }
       }
     }
@@ -480,11 +483,13 @@ public:
       roomCfg.temp_setauto = msg.toFloat();
       if (fabs(roomCfg.temp_setauto - old) >= 0.1f)
         log("AUTO CHANGE", "temp_setauto = " + String(roomCfg.temp_setauto));
+
     } else if (param == "hum_setauto") {
       float old = roomCfg.hum_setauto;
       roomCfg.hum_setauto = msg.toFloat();
       if (fabs(roomCfg.hum_setauto - old) >= 0.1f)
         log("AUTO CHANGE", "hum_setauto = " + String(roomCfg.hum_setauto));
+
     } else if (param == "thr_temp") {
       float old = roomCfg.thr_temp;
       roomCfg.thr_temp = msg.toFloat();
@@ -556,14 +561,12 @@ public:
     }
 
     if (ac.fac == "casper") {
-      log("IR SEND", "Casper: CHUA CO MA RAW, CAN BO SUNG SAU");
+      log("IR SEND", "Casper: CHUA CO MA RAW");
       return;
     }
 
     log("IR SEND", "HANG KHONG HO TRO: " + ac.fac);
   }
-
-  RoomConfig& getRoomCfg() { return roomCfg; }
 
 private:
   RoomConfig &roomCfg;
@@ -597,6 +600,32 @@ private:
 
     ac.mode = mode;
     ac.sent_temp = targetTemp;
+
+    // ================== AUTO → TỰ BẬT POWER ==================
+    if (ac.opr_mode == "auto") {
+      if (ac.power != "on") {
+        ac.power = "on";
+        log("AUTO POWER", ac.name + " → BAT POWER DO AUTO");
+        irQueue.enqueue(index, false);
+      }
+    }
+
+    // ================== IR FAIL CHECK 5 PHÚT ==================
+    if (ac.lastAutoIrMs > 0 && (millis() - ac.lastAutoIrMs > 300000)) {
+      if (!isnan(ac.lastAutoRoomTemp) &&
+          fabs(t_room - ac.lastAutoRoomTemp) < 0.5f) {
+
+        String errTopic = String(BUILDING_ID) + "/" + ROOM_ID +
+                          "/ac/" + String(index + 1) + "/error";
+
+        mqttClient.publish(errTopic.c_str(), "ir_fail", true);
+
+        log("IR FAIL", ac.name + " KHONG THAY DOI NHIET DO SAU 5 PHÚT");
+      }
+
+      ac.lastAutoIrMs = millis();
+      ac.lastAutoRoomTemp = t_room;
+    }
 
     if (fabs(ac.sent_temp - oldSent) >= 0.5f || ac.mode != oldMode) {
       log("AUTO CHANGE",
@@ -665,7 +694,9 @@ public:
   bool isMqttConnected() const { return mqttConnected; }
   bool isEthernetReady() const { return ethernetReady; }
   bool isNtpSynced() const { return ntpSynced; }
+//
 
+//
   void publishRoomState() {
     StaticJsonDocument<4096> doc;
 
@@ -768,17 +799,17 @@ private:
   }
 
   void mqttSubscribeAll() {
-    String t_ac = String(BUILDING_ID) + "/" + ROOM_ID + "/ac/+/+";
-    mqttClient.subscribe(t_ac.c_str());
-    log("MQTT SUB", t_ac);
+    mqttClient.subscribe((String(BUILDING_ID) + "/" + ROOM_ID + "/ac/+/power").c_str());
+    mqttClient.subscribe((String(BUILDING_ID) + "/" + ROOM_ID + "/ac/+/mode").c_str());
+    mqttClient.subscribe((String(BUILDING_ID) + "/" + ROOM_ID + "/ac/+/speed").c_str());
+    mqttClient.subscribe((String(BUILDING_ID) + "/" + ROOM_ID + "/ac/+/swing").c_str());
+    mqttClient.subscribe((String(BUILDING_ID) + "/" + ROOM_ID + "/ac/+/ctrl_temp").c_str());
+    mqttClient.subscribe((String(BUILDING_ID) + "/" + ROOM_ID + "/ac/+/fac").c_str());
 
     String baseCfg = String(BUILDING_ID) + "/" + ROOM_ID + "/config/";
     mqttClient.subscribe((baseCfg + "temp_setauto").c_str());
     mqttClient.subscribe((baseCfg + "hum_setauto").c_str());
     mqttClient.subscribe((baseCfg + "thr_temp").c_str());
-    log("MQTT SUB", baseCfg + "temp_setauto");
-    log("MQTT SUB", baseCfg + "hum_setauto");
-    log("MQTT SUB", baseCfg + "thr_temp");
 
     String t_env = String(BUILDING_ID) + "/outdoor/sensor/1/temp";
     mqttClient.subscribe(t_env.c_str());
@@ -814,6 +845,7 @@ private:
     }
   }
 
+
   void handleEthernetLink() {
     if (Ethernet.linkStatus() == LinkOFF) {
       if (ethernetReady) {
@@ -831,9 +863,14 @@ private:
 
   void handleMqtt() {
     bool prevConn = mqttConnected;
-    if (!mqttClient.connected()) {
-      mqttReconnect();
+    //
+    static unsigned long lastCheck = 0;
+    if (millis() - lastCheck > 3000) {   // 3 giây
+        lastCheck = millis();
+        if (!mqttClient.connected()) mqttReconnect();
     }
+
+    //
     mqttClient.loop();
     mqttConnected = mqttClient.connected();
     if (!mqttConnected && prevConn) {
@@ -911,7 +948,6 @@ private:
     String lvl3 = (p3 > 0 && p4 > p3) ? t.substring(p3 + 1, p4) : "";
     String lvl4 = (p4 > 0) ? t.substring(p4 + 1) : "";
 
-    // AC control: elb/prl/ac/<id>/<param>
     if (lvl0 == BUILDING_ID && lvl1 == ROOM_ID && lvl2 == "ac") {
       int acIndex = lvl3.toInt() - 1;
       if (acIndex >= 0 && acIndex < NUM_AC) {
@@ -921,14 +957,12 @@ private:
       return;
     }
 
-    // Config: elb/prl/config/<param>
     if (lvl0 == BUILDING_ID && lvl1 == ROOM_ID && lvl2 == "config") {
       acManager.updateConfig(lvl3, msg);
       oled.wake();
       return;
     }
 
-    // Outdoor temp: elb/outdoor/sensor/1/temp
     if (lvl0 == BUILDING_ID && lvl1 == "outdoor" && lvl2 == "sensor" && lvl3 == "1" && lvl4 == "temp") {
       acManager.setOutdoorTemp(msg.toFloat());
       return;
@@ -1019,8 +1053,10 @@ void loop() {
   static unsigned long lastBeat = 0;
   if (millis() - lastBeat > 2000) {
     lastBeat = millis();
+    #if DEBUG
     Serial.print("[HB] loop alive, ms=");
     Serial.println(millis());
+    #endif
   }
 
   netMgr.loop();
@@ -1059,8 +1095,26 @@ void loop() {
     });
   }
 
+  // ================== IR ROUND ROBIN 10 GIÂY ==================
+  static unsigned long lastRoundIr = 0;
+  static int roundIndex = 0;
+
+  if (millis() - lastRoundIr > 10000) {
+    lastRoundIr = millis();
+
+    if (acs[roundIndex].opr_mode == "auto" && acs[roundIndex].power == "on") {
+      irQueueMgr.enqueue(roundIndex, false);
+      Serial.print("[");
+      Serial.print(timeClient.getFormattedTime());
+      Serial.print("] IR ROUND ROBIN → ");
+      Serial.println(acs[roundIndex].name);
+    }
+
+    roundIndex = (roundIndex + 1) % NUM_AC;
+  }
+
   static uint32_t lastPub = 0;
-  if (millis() - lastPub > 20000) {
+  if (millis() - lastPub > 60000) {
     lastPub = millis();
     netMgr.publishRoomState();
   }
